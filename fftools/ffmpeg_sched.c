@@ -71,7 +71,7 @@ typedef struct SchTask {
 
     SchThreadFunc       func;
     void               *func_arg;
-    ThreadStat          thread_stat[64];
+    ThreadStat          thread_stat[MAX_TASK_THREAD_POOL_SIZE];
     int                 threads_count;
 } SchTask;
 
@@ -423,8 +423,6 @@ static int task_start(SchTask *task)
             av_log(task->func_arg, AV_LOG_ERROR, "pthread_create() %d failed: %s\n",
                    i, strerror(ret));
             return AVERROR(ret);
-        } else {
-            av_log(task->func_arg, AV_LOG_ERROR, "pthread_create() succussed: %d\n",i);
         }
         task->thread_stat[i].thread_running = 1;
     }
@@ -441,7 +439,9 @@ static void task_init(Scheduler *sch, SchTask *task, enum SchedulerNodeType type
 
     task->func      = func;
     task->func_arg  = func_arg;
+
     task->threads_count = threads_count;
+    av_assert0(task->threads_count <= MAX_TASK_THREAD_POOL_SIZE && task->threads_count > 0);
 }
 
 static int64_t trailing_dts(const Scheduler *sch, int count_finished)

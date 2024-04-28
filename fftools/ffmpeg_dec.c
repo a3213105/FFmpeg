@@ -1371,16 +1371,11 @@ int dec_init(Decoder **pdec, Scheduler *sch,
 
     *pdec = NULL;
     
-    if (o->codec->type == AVMEDIA_TYPE_VIDEO) {
-        dec_threads = 1;
-        e = av_dict_get(*dec_opts, "dec_threads", NULL, 0);
-        if (e) {
-            av_log(sch, AV_LOG_ERROR, "get dec_opts %s : %s\n", e->key, e->value);
-            dec_threads = strtol(e->value, NULL, 0);
-            av_dict_set(dec_opts, e->key, NULL, 0);
-        } else {
-            av_log(*dec_opts, AV_LOG_ERROR, "not get dec_opts dec_threads\n");
-        }
+    if ((e = av_dict_get(*dec_opts, "dec_threads", NULL, 0)) && o->codec->type == AVMEDIA_TYPE_VIDEO) {
+        av_log(sch, AV_LOG_INFO, "get dec_opts %s : %s\n", e->key, e->value);
+        dec_threads = strtol(e->value, NULL, 0);
+        av_assert0(dec_threads < MAX_TASK_THREAD_POOL_SIZE && dec_threads > 0);
+        av_dict_set(dec_opts, e->key, NULL, 0);
     } else {
         dec_threads = 1;
     }

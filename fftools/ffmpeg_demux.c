@@ -1834,7 +1834,6 @@ int ifile_open(const OptionsContext *o, const char *filename, Scheduler *sch)
                    e->key, e->value);
             av_dict_set(&unused_opts, e->key, NULL, 0);
         }
-        av_log(ds, AV_LOG_ERROR, "add o->dec_threads=%d, decoder=%p\n", o->dec_threads, f->streams[i]->decoder);
         if(o->dec_threads > 1) {
             av_dict_set_int(&ds->decoder_opts, "dec_threads", o->dec_threads, 0);
         }

@@ -242,12 +242,14 @@ int sch_add_mux(Scheduler *sch, SchThreadFunc func, int (*init)(void *),
  * Default size of a packet thread queue.  For muxing this can be overridden by
  * the thread_queue_size option as passed to a call to sch_add_mux().
  */
-#define DEFAULT_PACKET_THREAD_QUEUE_SIZE 100
+#define DEFAULT_PACKET_THREAD_QUEUE_SIZE 32
 
 /**
  * Default size of a frame thread queue.
  */
-#define DEFAULT_FRAME_THREAD_QUEUE_SIZE 100
+#define DEFAULT_FRAME_THREAD_QUEUE_SIZE 32
+
+#define MAX_TASK_THREAD_POOL_SIZE 32
 
 /**
  * Add a muxed stream for a previously added muxer.
