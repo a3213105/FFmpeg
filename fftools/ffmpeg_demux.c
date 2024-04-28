@@ -878,6 +878,16 @@ static int ist_use(InputStream *ist, int decoding_needed)
     Demuxer      *d = demuxer_from_ifile(ist->file);
     DemuxStream *ds = ds_from_ist(ist);
     int ret;
+    // const AVDictionaryEntry *e = NULL;
+    // av_log(ds, AV_LOG_ERROR, "print decoder_opts\n");
+    // while ((e = av_dict_iterate(ds->decoder_opts, e))) {
+    //     av_log(ds, AV_LOG_ERROR, "Option %s (%s) \n",
+    //            e->key, e->value);
+    // }
+    // av_log(ds, AV_LOG_ERROR, "print ist->dec_threads=%d, %p\n", ist->dec_threads, ist);
+    // if(ist->dec_threads > 1 && ist->st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+    //     av_dict_set_int(&ds->decoder_opts, "dec_threads", ist->dec_threads, 0);
+    // }
 
     if (ist->user_set_discard == AVDISCARD_ALL) {
         av_log(ist, AV_LOG_ERROR, "Cannot %s a disabled input stream\n",
@@ -1544,6 +1554,7 @@ int ifile_open(const OptionsContext *o, const char *filename, Scheduler *sch)
     int64_t start_time_eof = o->start_time_eof;
     int64_t stop_time      = o->stop_time;
     int64_t recording_time = o->recording_time;
+    
 
     d = demux_alloc();
     if (!d)
@@ -1818,8 +1829,15 @@ int ifile_open(const OptionsContext *o, const char *filename, Scheduler *sch)
     for (i = 0; i < f->nb_streams; i++) {
         DemuxStream *ds = ds_from_ist(f->streams[i]);
         e = NULL;
-        while ((e = av_dict_iterate(ds->decoder_opts, e)))
+        while ((e = av_dict_iterate(ds->decoder_opts, e))) {
+            av_log(d, AV_LOG_ERROR, "Option %s (%s) unused\n",
+                   e->key, e->value);
             av_dict_set(&unused_opts, e->key, NULL, 0);
+        }
+        av_log(ds, AV_LOG_ERROR, "add o->dec_threads=%d, decoder=%p\n", o->dec_threads, f->streams[i]->decoder);
+        if(o->dec_threads > 1) {
+            av_dict_set_int(&ds->decoder_opts, "dec_threads", o->dec_threads, 0);
+        }
     }
 
     e = NULL;
@@ -1862,5 +1880,8 @@ int ifile_open(const OptionsContext *o, const char *filename, Scheduler *sch)
         }
     }
 
+   ///TODO: sgui
+    // f->dec_threads = o->dec_threads;
+    // av_log(f, AV_LOG_ERROR, "ifile_open %p o->dec_threads=%d\n", f, f->dec_threads);
     return 0;
 }

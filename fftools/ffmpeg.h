@@ -141,6 +141,7 @@ typedef struct OptionsContext {
     /* input options */
     int64_t input_ts_offset;
     int loop;
+    int dec_threads;
     int rate_emu;
     float readrate;
     double readrate_initial_burst;
@@ -386,9 +387,12 @@ typedef struct Decoder {
     int              subtitle_header_size;
 
     // number of frames/samples retrieved from the decoder
-    uint64_t         frames_decoded;
-    uint64_t         samples_decoded;
-    uint64_t         decode_errors;
+    // uint64_t         frames_decoded;
+    // uint64_t         samples_decoded;
+    // uint64_t         decode_errors;
+    atomic_uint_fast64_t         frames_decoded;
+    atomic_uint_fast64_t         samples_decoded;
+    atomic_uint_fast64_t         decode_errors;
 } Decoder;
 
 typedef struct InputStream {
@@ -422,7 +426,7 @@ typedef struct InputStream {
     /* decoded data from this stream goes into all those filters
      * currently video and audio only */
     InputFilter         **filters;
-    int                nb_filters;
+    int                   nb_filters;
 
     /*
      * Output targets that do not go through lavfi, i.e. subtitles or
@@ -430,7 +434,9 @@ typedef struct InputStream {
      * having an encoder or not.
      */
     struct OutputStream **outputs;
-    int                nb_outputs;
+    int                   nb_outputs;
+
+    int                   dec_threads;
 } InputStream;
 
 typedef struct InputFile {
@@ -454,6 +460,8 @@ typedef struct InputFile {
      * if new streams appear dynamically during demuxing */
     InputStream    **streams;
     int           nb_streams;
+
+    int           dec_threads;
 } InputFile;
 
 enum forced_keyframes_const {

@@ -60,35 +60,39 @@ typedef struct SchWaiter {
     int                 choked_next;
 } SchWaiter;
 
+typedef struct ThreadStat {
+    pthread_t           thread;
+    int                 thread_running;
+} ThreadStat;
+
 typedef struct SchTask {
     Scheduler          *parent;
     SchedulerNode       node;
 
     SchThreadFunc       func;
     void               *func_arg;
-
-    pthread_t           thread;
-    int                 thread_running;
+    ThreadStat          thread_stat[64];
+    int                 threads_count;
 } SchTask;
 
 typedef struct SchDec {
     const AVClass      *class;
 
-    SchedulerNode       src;
-    SchedulerNode      *dst;
-    uint8_t            *dst_finished;
-    unsigned         nb_dst;
+    SchedulerNode        src;
+    SchedulerNode       *dst;
+    uint8_t             *dst_finished;
+    unsigned             nb_dst;
 
-    SchTask             task;
+    SchTask              task;
     // Queue for receiving input packets, one stream.
-    ThreadQueue        *queue;
+    ThreadQueue         *queue;
 
     // Queue for sending post-flush end timestamps back to the source
     AVThreadMessageQueue *queue_end_ts;
-    int                 expect_end_ts;
+    int                   expect_end_ts;
 
     // temporary storage used by sch_dec_send()
-    AVFrame            *send_frame;
+    AVFrame              *send_frame;
 } SchDec;
 
 typedef struct SchSyncQueue {
@@ -270,30 +274,30 @@ struct Scheduler {
     const AVClass      *class;
 
     SchDemux           *demux;
-    unsigned         nb_demux;
+    unsigned            nb_demux;
 
     SchMux             *mux;
-    unsigned         nb_mux;
+    unsigned            nb_mux;
 
-    unsigned         nb_mux_ready;
+    unsigned            nb_mux_ready;
     pthread_mutex_t     mux_ready_lock;
 
-    unsigned         nb_mux_done;
+    unsigned            nb_mux_done;
     pthread_mutex_t     mux_done_lock;
     pthread_cond_t      mux_done_cond;
 
 
     SchDec             *dec;
-    unsigned         nb_dec;
+    unsigned            nb_dec;
 
     SchEnc             *enc;
-    unsigned         nb_enc;
+    unsigned            nb_enc;
 
     SchSyncQueue       *sq_enc;
-    unsigned         nb_sq_enc;
+    unsigned            nb_sq_enc;
 
     SchFilterGraph     *filters;
-    unsigned         nb_filters;
+    unsigned            nb_filters;
 
     char               *sdp_filename;
     int                 sdp_auto;
@@ -411,21 +415,24 @@ static int task_start(SchTask *task)
 
     av_log(task->func_arg, AV_LOG_VERBOSE, "Starting thread...\n");
 
-    av_assert0(!task->thread_running);
+    for(int i=0;i<task->threads_count;i++) {
+        av_assert0(!task->thread_stat[i].thread_running);
 
-    ret = pthread_create(&task->thread, NULL, task_wrapper, task);
-    if (ret) {
-        av_log(task->func_arg, AV_LOG_ERROR, "pthread_create() failed: %s\n",
-               strerror(ret));
-        return AVERROR(ret);
+        ret = pthread_create(&task->thread_stat[i].thread, NULL, task_wrapper, task);
+        if (ret) {
+            av_log(task->func_arg, AV_LOG_ERROR, "pthread_create() %d failed: %s\n",
+                   i, strerror(ret));
+            return AVERROR(ret);
+        } else {
+            av_log(task->func_arg, AV_LOG_ERROR, "pthread_create() succussed: %d\n",i);
+        }
+        task->thread_stat[i].thread_running = 1;
     }
-
-    task->thread_running = 1;
     return 0;
 }
 
 static void task_init(Scheduler *sch, SchTask *task, enum SchedulerNodeType type, unsigned idx,
-                      SchThreadFunc func, void *func_arg)
+                      SchThreadFunc func, void *func_arg, int threads_count)
 {
     task->parent    = sch;
 
@@ -434,6 +441,7 @@ static void task_init(Scheduler *sch, SchTask *task, enum SchedulerNodeType type
 
     task->func      = func;
     task->func_arg  = func_arg;
+    task->threads_count = threads_count;
 }
 
 static int64_t trailing_dts(const Scheduler *sch, int count_finished)
@@ -634,7 +642,7 @@ int sch_add_mux(Scheduler *sch, SchThreadFunc func, int (*init)(void *),
     mux->init       = init;
     mux->queue_size = thread_queue_size;
 
-    task_init(sch, &mux->task, SCH_NODE_TYPE_MUX, idx, func, arg);
+    task_init(sch, &mux->task, SCH_NODE_TYPE_MUX, idx, func, arg, 1);
 
     sch->sdp_auto &= sdp_auto;
 
@@ -686,7 +694,7 @@ int sch_add_demux(Scheduler *sch, SchThreadFunc func, void *ctx)
 
     d = &sch->demux[idx];
 
-    task_init(sch, &d->task, SCH_NODE_TYPE_DEMUX, idx, func, ctx);
+    task_init(sch, &d->task, SCH_NODE_TYPE_DEMUX, idx, func, ctx, 1);
 
     d->class    = &sch_demux_class;
     d->send_pkt = av_packet_alloc();
@@ -719,7 +727,7 @@ static const AVClass sch_dec_class = {
 };
 
 int sch_add_dec(Scheduler *sch, SchThreadFunc func, void *ctx,
-                int send_end_ts)
+                int send_end_ts, int threads_count)
 {
     const unsigned idx = sch->nb_dec;
 
@@ -732,7 +740,7 @@ int sch_add_dec(Scheduler *sch, SchThreadFunc func, void *ctx,
 
     dec = &sch->dec[idx];
 
-    task_init(sch, &dec->task, SCH_NODE_TYPE_DEC, idx, func, ctx);
+    task_init(sch, &dec->task, SCH_NODE_TYPE_DEC, idx, func, ctx, threads_count);
 
     dec->class      = &sch_dec_class;
     dec->send_frame = av_frame_alloc();
@@ -777,7 +785,7 @@ int sch_add_enc(Scheduler *sch, SchThreadFunc func, void *ctx,
     enc->sq_idx[0]  = -1;
     enc->sq_idx[1]  = -1;
 
-    task_init(sch, &enc->task, SCH_NODE_TYPE_ENC, idx, func, ctx);
+    task_init(sch, &enc->task, SCH_NODE_TYPE_ENC, idx, func, ctx, 1);
 
     enc->send_pkt = av_packet_alloc();
     if (!enc->send_pkt)
@@ -811,7 +819,7 @@ int sch_add_filtergraph(Scheduler *sch, unsigned nb_inputs, unsigned nb_outputs,
 
     fg->class = &sch_fg_class;
 
-    task_init(sch, &fg->task, SCH_NODE_TYPE_FILTER_IN, idx, func, ctx);
+    task_init(sch, &fg->task, SCH_NODE_TYPE_FILTER_IN, idx, func, ctx, 1);
 
     if (nb_inputs) {
         fg->inputs = av_calloc(nb_inputs, sizeof(*fg->inputs));
@@ -1566,7 +1574,6 @@ int sch_start(Scheduler *sch)
 
     for (unsigned i = 0; i < sch->nb_dec; i++) {
         SchDec *dec = &sch->dec[i];
-
         ret = task_start(&dec->task);
         if (ret < 0)
             goto fail;
@@ -2490,13 +2497,20 @@ static int task_stop(Scheduler *sch, SchTask *task)
     int ret;
     void *thread_ret;
 
-    if (!task->thread_running)
-        return task_cleanup(sch, task->node);
+    for(int i=0;i<task->threads_count;i++) {
+        if (task->thread_stat[i].thread_running) {
+            ret = pthread_join(task->thread_stat[i].thread, &thread_ret);
+            av_assert0(ret == 0);
+            task->thread_stat[i].thread_running = 0;
+        }
+    }
+    // if (!task->thread_running)
+    //     return task_cleanup(sch, task->node);
 
-    ret = pthread_join(task->thread, &thread_ret);
-    av_assert0(ret == 0);
+    // ret = pthread_join(task->thread, &thread_ret);
+    // av_assert0(ret == 0);
 
-    task->thread_running = 0;
+    // task->thread_running = 0;
 
     return (intptr_t)thread_ret;
 }

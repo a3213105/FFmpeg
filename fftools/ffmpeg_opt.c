@@ -1392,6 +1392,8 @@ const OptionDef options[] = {
     { "map_chapters",           OPT_TYPE_INT, OPT_EXPERT | OPT_OFFSET | OPT_OUTPUT,
         { .off = OFFSET(chapters_input_file) },
         "set chapters mapping", "input_file_index" },
+    { "dec_threads",         OPT_TYPE_INT, OPT_EXPERT | OPT_INPUT | OPT_DECODER | OPT_OFFSET,
+        { .off = OFFSET(dec_threads) }, "set number of dec_threads of input stream shall be used", "dec threads count" },
     { "t",                      OPT_TYPE_TIME, OPT_OFFSET | OPT_INPUT | OPT_OUTPUT,
         { .off = OFFSET(recording_time) },
         "stop transcoding after specified duration",

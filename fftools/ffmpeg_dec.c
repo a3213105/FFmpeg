@@ -77,6 +77,10 @@ typedef struct DecoderPriv {
     char                log_name[32];
     char               *parent_name;
 
+    pthread_mutex_t     lock;
+    pthread_cond_t      cond;
+    int                 dec_threads;
+
     struct {
         AVDictionary       *opts;
         const AVCodec      *codec;
@@ -116,6 +120,9 @@ void dec_free(Decoder **pdec)
 
     av_freep(&dp->parent_name);
 
+    pthread_cond_destroy(&dp->cond);
+    pthread_mutex_destroy(&dp->lock);
+
     av_freep(pdec);
 }
 
@@ -135,7 +142,7 @@ static const AVClass dec_class = {
 
 static int decoder_thread(void *arg);
 
-static int dec_alloc(DecoderPriv **pdec, Scheduler *sch, int send_end_ts)
+static int dec_alloc(DecoderPriv **pdec, Scheduler *sch, int send_end_ts, int dec_threads)
 {
     DecoderPriv *dp;
     int ret = 0;
@@ -160,12 +167,24 @@ static int dec_alloc(DecoderPriv **pdec, Scheduler *sch, int send_end_ts)
     dp->last_frame_pts               = AV_NOPTS_VALUE;
     dp->last_frame_tb                = (AVRational){ 1, 1 };
     dp->hwaccel_pix_fmt              = AV_PIX_FMT_NONE;
+    dp->dec_threads                  = dec_threads;
 
-    ret = sch_add_dec(sch, decoder_thread, dp, send_end_ts);
+    ret = sch_add_dec(sch, decoder_thread, dp, send_end_ts, dp->dec_threads);
     if (ret < 0)
         goto fail;
     dp->sch     = sch;
     dp->sch_idx = ret;
+
+    ret = pthread_cond_init(&dp->cond, NULL);
+    if (ret) {
+        goto fail;
+    }
+
+    ret = pthread_mutex_init(&dp->lock, NULL);
+    if (ret) {
+        pthread_cond_destroy(&dp->cond);
+        goto fail;
+    }
 
     *pdec = dp;
 
@@ -657,9 +676,9 @@ static int transcode_subtitles(DecoderPriv *dp, const AVPacket *pkt,
     return process_subtitle(dp, frame);
 }
 
-static int packet_decode(DecoderPriv *dp, AVPacket *pkt, AVFrame *frame)
+static int packet_decode(DecoderPriv *dp, AVCodecContext *dec_ctx, AVPacket *pkt, AVFrame *frame, int thread_id)
 {
-    AVCodecContext *dec = dp->dec_ctx;
+    AVCodecContext *dec = dec_ctx;//dp->dec_ctx;
     const char *type_desc = av_get_media_type_string(dec->codec_type);
     int ret;
 
@@ -750,22 +769,42 @@ static int packet_decode(DecoderPriv *dp, AVPacket *pkt, AVFrame *frame)
 
         frame->time_base = dec->pkt_timebase;
 
+        //lock for single threads
+        
         if (dec->codec_type == AVMEDIA_TYPE_AUDIO) {
             dp->dec.samples_decoded += frame->nb_samples;
 
             audio_ts_process(dp, frame);
+            dp->dec.frames_decoded++;
+            ret = sch_dec_send(dp->sch, dp->sch_idx, frame);
         } else {
+            pthread_mutex_lock(&dp->lock);
+            while (dp->dec.frames_decoded < frame->pts) {
+                // av_log(dp, AV_LOG_ERROR, "Decoder %d thread wait for packet %ld, frame %ld, frames %ld\n", 
+                //               thread_id, pkt->pts, frame->pts, dp->dec.frames_decoded);
+                pthread_cond_wait(&dp->cond, &dp->lock);
+            }
             ret = video_frame_process(dp, frame);
             if (ret < 0) {
                 av_log(dp, AV_LOG_FATAL,
                        "Error while processing the decoded data\n");
                 return ret;
             }
+            
+            dp->dec.frames_decoded++;
+            ret = sch_dec_send(dp->sch, dp->sch_idx, frame);
+            pthread_cond_broadcast(&dp->cond);
+            if(pkt->pts!=dp->last_frame_pts)
+                av_log(dp, AV_LOG_ERROR, "Decoder %d thread send packet %ld, last_frame_pts %ld\n", 
+                  thread_id, pkt->pts, dp->last_frame_pts);
+            pthread_mutex_unlock(&dp->lock);
         }
 
-        dp->dec.frames_decoded++;
+        // dp->dec.frames_decoded++;
+        // av_log(dp, AV_LOG_ERROR, "Decoder %d thread process packet %ld,%ld, frame %ld\n", 
+        //       thread_id, pkt->pts, pkt->dts, frame->pts);
+        // ret = sch_dec_send(dp->sch, dp->sch_idx, frame);
 
-        ret = sch_dec_send(dp->sch, dp->sch_idx, frame);
         if (ret < 0) {
             av_frame_unref(frame);
             return ret == AVERROR_EOF ? AVERROR_EXIT : ret;
@@ -853,17 +892,66 @@ fail:
     return AVERROR(ENOMEM);
 }
 
+static AVCodecContext* dec_copy(DecoderPriv* dp)
+{
+    const AVCodec *codec;
+    AVCodecParameters* par;
+    AVCodecContext* dec_ctx;
+    int ret;
+
+    par = avcodec_parameters_alloc();
+    codec = avcodec_find_decoder(dp->dec_ctx->codec_id);
+    dec_ctx = avcodec_alloc_context3(codec);
+    if (!dec_ctx)
+        return NULL;
+
+    ret = avcodec_parameters_from_context(par, dp->dec_ctx);
+    if (ret < 0) {
+        av_log(dp, AV_LOG_ERROR, "Error initializing the decoder context.\n");
+        return NULL;
+    }
+    ret = avcodec_parameters_to_context(dec_ctx, par);
+    if (ret < 0) {
+        av_log(dp, AV_LOG_ERROR, "Error initializing the decoder context.\n");
+        return NULL;
+    }
+
+    dec_ctx->opaque                = dp;
+    dec_ctx->get_format            = dp->dec_ctx->get_format;
+    dec_ctx->pkt_timebase          = dp->dec_ctx->pkt_timebase;
+    dec_ctx->flags                 = dp->dec_ctx->flags;
+    dec_ctx->apply_cropping        = dp->dec_ctx->apply_cropping;
+
+    if ((ret = avcodec_open2(dec_ctx, codec, NULL)) < 0) {
+        av_log(dp, AV_LOG_ERROR, "Error while opening decoder: %s\n",
+               av_err2str(ret));
+        return NULL;
+    }
+    return dec_ctx;
+}
+
+
 static int decoder_thread(void *arg)
 {
     DecoderPriv  *dp = arg;
     DecThreadContext dt;
-    int ret = 0, input_status = 0;
+    AVCodecContext *dec_ctx = NULL;
+    int ret = 0, input_status = 0, thread_id = -1;
+    static atomic_int threads_count = 0;
 
     ret = dec_thread_init(&dt);
     if (ret < 0)
         goto finish;
 
     dec_thread_set_name(dp);
+    if (dp->dec_threads == 1 || dp->dec.type != AVMEDIA_TYPE_VIDEO) {
+        dec_ctx = dp->dec_ctx;
+    } else {
+        dec_ctx = dec_copy(dp);
+        if(dec_ctx==NULL)
+            goto finish;
+    }
+    thread_id = threads_count++;
 
     while (!input_status) {
         int flush_buffers, have_data;
@@ -879,7 +967,7 @@ static int decoder_thread(void *arg)
                    flush_buffers ? "flush" : "EOF");
 
         // this is a standalone decoder that has not been initialized yet
-        if (!dp->dec_ctx) {
+        if (!dec_ctx) {
             if (flush_buffers)
                 continue;
             if (input_status < 0) {
@@ -893,8 +981,8 @@ static int decoder_thread(void *arg)
             if (ret < 0)
                 goto finish;
         }
-
-        ret = packet_decode(dp, have_data ? dt.pkt : NULL, dt.frame);
+        
+        ret = packet_decode(dp, dec_ctx, have_data ? dt.pkt : NULL, dt.frame, thread_id);
 
         av_packet_unref(dt.pkt);
         av_frame_unref(dt.frame);
@@ -915,12 +1003,12 @@ static int decoder_thread(void *arg)
                 break;
 
             /* report last frame duration to the scheduler */
-            if (dp->dec_ctx->codec_type == AVMEDIA_TYPE_AUDIO) {
+            if (dec_ctx->codec_type == AVMEDIA_TYPE_AUDIO) {
                 dt.pkt->pts       = dp->last_frame_pts + dp->last_frame_duration_est;
                 dt.pkt->time_base = dp->last_frame_tb;
             }
 
-            avcodec_flush_buffers(dp->dec_ctx);
+            avcodec_flush_buffers(dec_ctx);
         } else if (ret < 0) {
             av_log(dp, AV_LOG_ERROR, "Error processing packet in decoder: %s\n",
                    av_err2str(ret));
@@ -962,6 +1050,9 @@ static int decoder_thread(void *arg)
     }
 
 finish:
+    if (dec_ctx != dp->dec_ctx) {
+        avcodec_free_context(&dec_ctx);
+    }
     dec_thread_uninit(&dt);
 
     return ret;
@@ -1275,11 +1366,26 @@ int dec_init(Decoder **pdec, Scheduler *sch,
              AVFrame *param_out)
 {
     DecoderPriv *dp;
-    int ret;
+    int ret, dec_threads;
+    AVDictionaryEntry *e = NULL;
 
     *pdec = NULL;
+    
+    if (o->codec->type == AVMEDIA_TYPE_VIDEO) {
+        dec_threads = 1;
+        e = av_dict_get(*dec_opts, "dec_threads", NULL, 0);
+        if (e) {
+            av_log(sch, AV_LOG_ERROR, "get dec_opts %s : %s\n", e->key, e->value);
+            dec_threads = strtol(e->value, NULL, 0);
+            av_dict_set(dec_opts, e->key, NULL, 0);
+        } else {
+            av_log(*dec_opts, AV_LOG_ERROR, "not get dec_opts dec_threads\n");
+        }
+    } else {
+        dec_threads = 1;
+    }
 
-    ret = dec_alloc(&dp, sch, !!(o->flags & DECODER_FLAG_SEND_END_TS));
+    ret = dec_alloc(&dp, sch, !!(o->flags & DECODER_FLAG_SEND_END_TS), dec_threads);
     if (ret < 0)
         return ret;
 
@@ -1307,7 +1413,7 @@ int dec_create(const OptionsContext *o, const char *arg, Scheduler *sch)
     unsigned enc_idx;
     int ret;
 
-    ret = dec_alloc(&dp, sch, 0);
+    ret = dec_alloc(&dp, sch, 0, 1);
     if (ret < 0)
         return ret;
 

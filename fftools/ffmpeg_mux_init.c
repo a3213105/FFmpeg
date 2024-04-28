@@ -1137,15 +1137,18 @@ static int ost_add(Muxer *mux, const OptionsContext *o, enum AVMediaType type,
 
     av_log(ost, AV_LOG_VERBOSE, "Created %s stream from ",
            av_get_media_type_string(type));
-    if (ist)
+    if (ist) {
         av_log(ost, AV_LOG_VERBOSE, "input stream %d:%d",
                ist->file->index, ist->index);
-    else if (ofilter)
+        //TODO: sgui
+    } else if (ofilter) {
         av_log(ost, AV_LOG_VERBOSE, "complex filtergraph %d:[%s]\n",
                ofilter->graph->index, ofilter->name);
-    else if (type == AVMEDIA_TYPE_ATTACHMENT)
+    } else if (type == AVMEDIA_TYPE_ATTACHMENT) {
         av_log(ost, AV_LOG_VERBOSE, "attached file");
-    else av_assert0(0);
+    } else {
+        av_assert0(0);
+    }
     av_log(ost, AV_LOG_VERBOSE, "\n");
 
     ms->pkt = av_packet_alloc();
