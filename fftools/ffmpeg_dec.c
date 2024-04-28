@@ -77,9 +77,12 @@ typedef struct DecoderPriv {
     char                log_name[32];
     char               *parent_name;
 
-    pthread_mutex_t     lock;
-    pthread_cond_t      cond;
-    int                 dec_threads;
+    pthread_mutex_t     exit_lock;
+    pthread_cond_t      exit_cond;
+    pthread_mutex_t     reorder_lock;
+    pthread_cond_t      reorder_cond;
+    int                 frame_decode_thread_num;
+    int                 threads_count;
 
     struct {
         AVDictionary       *opts;
@@ -120,8 +123,10 @@ void dec_free(Decoder **pdec)
 
     av_freep(&dp->parent_name);
 
-    pthread_cond_destroy(&dp->cond);
-    pthread_mutex_destroy(&dp->lock);
+    pthread_cond_destroy(&dp->reorder_cond);
+    pthread_mutex_destroy(&dp->reorder_lock);
+    pthread_cond_destroy(&dp->exit_cond);
+    pthread_mutex_destroy(&dp->exit_lock);
 
     av_freep(pdec);
 }
@@ -167,24 +172,39 @@ static int dec_alloc(DecoderPriv **pdec, Scheduler *sch, int send_end_ts, int de
     dp->last_frame_pts               = AV_NOPTS_VALUE;
     dp->last_frame_tb                = (AVRational){ 1, 1 };
     dp->hwaccel_pix_fmt              = AV_PIX_FMT_NONE;
-    dp->dec_threads                  = dec_threads;
+    dp->frame_decode_thread_num      = dec_threads;
 
-    ret = sch_add_dec(sch, decoder_thread, dp, send_end_ts, dp->dec_threads);
+    ret = sch_add_dec(sch, decoder_thread, dp, send_end_ts, dp->frame_decode_thread_num);
     if (ret < 0)
         goto fail;
     dp->sch     = sch;
     dp->sch_idx = ret;
 
-    ret = pthread_cond_init(&dp->cond, NULL);
+    ret = pthread_cond_init(&dp->reorder_cond, NULL);
     if (ret) {
         goto fail;
     }
 
-    ret = pthread_mutex_init(&dp->lock, NULL);
+    ret = pthread_mutex_init(&dp->reorder_lock, NULL);
     if (ret) {
-        pthread_cond_destroy(&dp->cond);
+        pthread_cond_destroy(&dp->reorder_cond);
         goto fail;
     }
+
+    ret = pthread_cond_init(&dp->exit_cond, NULL);
+    if (ret) {
+        pthread_mutex_destroy(&dp->reorder_lock);
+        pthread_cond_destroy(&dp->reorder_cond);
+        goto fail;
+    }
+    ret = pthread_mutex_init(&dp->exit_lock, NULL);
+    if (ret) {
+        pthread_mutex_destroy(&dp->reorder_lock);
+        pthread_cond_destroy(&dp->reorder_cond);
+        pthread_cond_destroy(&dp->exit_cond);
+        goto fail;
+    }
+
 
     *pdec = dp;
 
@@ -731,7 +751,7 @@ static int packet_decode(DecoderPriv *dp, AVCodecContext *dec_ctx, AVPacket *pkt
 
         update_benchmark(NULL);
         ret = avcodec_receive_frame(dec, frame);
-        update_benchmark("decode_%s %s", type_desc, dp->parent_name);
+        update_benchmark("decode_%s_%d %s", type_desc, thread_id, dp->parent_name);
 
         if (ret == AVERROR(EAGAIN)) {
             av_assert0(pkt); // should never happen during flushing
@@ -778,11 +798,12 @@ static int packet_decode(DecoderPriv *dp, AVCodecContext *dec_ctx, AVPacket *pkt
             dp->dec.frames_decoded++;
             ret = sch_dec_send(dp->sch, dp->sch_idx, frame);
         } else {
-            pthread_mutex_lock(&dp->lock);
+            update_benchmark(NULL);
+            pthread_mutex_lock(&dp->reorder_lock);
             while (dp->dec.frames_decoded < frame->pts) {
                 // av_log(dp, AV_LOG_ERROR, "Decoder %d thread wait for packet %ld, frame %ld, frames %ld\n", 
                 //               thread_id, pkt->pts, frame->pts, dp->dec.frames_decoded);
-                pthread_cond_wait(&dp->cond, &dp->lock);
+                pthread_cond_wait(&dp->reorder_cond, &dp->reorder_lock);
             }
             ret = video_frame_process(dp, frame);
             if (ret < 0) {
@@ -793,11 +814,12 @@ static int packet_decode(DecoderPriv *dp, AVCodecContext *dec_ctx, AVPacket *pkt
             
             dp->dec.frames_decoded++;
             ret = sch_dec_send(dp->sch, dp->sch_idx, frame);
-            pthread_cond_broadcast(&dp->cond);
+            pthread_cond_broadcast(&dp->reorder_cond);
             if(pkt->pts!=dp->last_frame_pts)
                 av_log(dp, AV_LOG_ERROR, "Decoder %d thread send packet %ld, last_frame_pts %ld\n", 
                   thread_id, pkt->pts, dp->last_frame_pts);
-            pthread_mutex_unlock(&dp->lock);
+            pthread_mutex_unlock(&dp->reorder_lock);
+            update_benchmark("postprocess_%s_%d %s", type_desc, thread_id, dp->parent_name);
         }
 
         // dp->dec.frames_decoded++;
@@ -937,21 +959,23 @@ static int decoder_thread(void *arg)
     DecThreadContext dt;
     AVCodecContext *dec_ctx = NULL;
     int ret = 0, input_status = 0, thread_id = -1;
-    static atomic_int threads_count = 0;
 
     ret = dec_thread_init(&dt);
     if (ret < 0)
         goto finish;
 
     dec_thread_set_name(dp);
-    if (dp->dec_threads == 1 || dp->dec.type != AVMEDIA_TYPE_VIDEO) {
+    if (dp->frame_decode_thread_num == 1 || dp->dec.type != AVMEDIA_TYPE_VIDEO) {
         dec_ctx = dp->dec_ctx;
+        thread_id = 0;
     } else {
         dec_ctx = dec_copy(dp);
         if(dec_ctx==NULL)
             goto finish;
+        pthread_mutex_lock(&dp->exit_lock);
+        thread_id = dp->threads_count++;
+        pthread_mutex_unlock(&dp->exit_lock);
     }
-    thread_id = threads_count++;
 
     while (!input_status) {
         int flush_buffers, have_data;
@@ -962,10 +986,10 @@ static int decoder_thread(void *arg)
              (intptr_t)dt.pkt->opaque == PKT_OPAQUE_SUB_HEARTBEAT ||
              (intptr_t)dt.pkt->opaque == PKT_OPAQUE_FIX_SUB_DURATION);
         flush_buffers = input_status >= 0 && !have_data;
-        if (!have_data)
-            av_log(dp, AV_LOG_VERBOSE, "Decoder thread received %s packet\n",
-                   flush_buffers ? "flush" : "EOF");
-
+        if (!have_data) {
+            av_log(dp, AV_LOG_VERBOSE, "Decoder thread %d (%d) received %s packet\n",
+                   thread_id, dp->threads_count, flush_buffers ? "flush" : "EOF");
+        }
         // this is a standalone decoder that has not been initialized yet
         if (!dec_ctx) {
             if (flush_buffers)
@@ -991,6 +1015,7 @@ static int decoder_thread(void *arg)
         // AVERROR_EXIT - EOF from the scheduler
         // we treat them differently when flushing
         if (ret == AVERROR_EXIT) {
+            av_log(dp, AV_LOG_INFO, "Decoder returned AVERROR_EXIT\n");
             ret = AVERROR_EOF;
             flush_buffers = 0;
         }
@@ -998,9 +1023,22 @@ static int decoder_thread(void *arg)
         if (ret == AVERROR_EOF) {
             av_log(dp, AV_LOG_VERBOSE, "Decoder returned EOF, %s\n",
                    flush_buffers ? "resetting" : "finishing");
-
-            if (!flush_buffers)
+            if (!flush_buffers) {
+                if (dp->frame_decode_thread_num > 1 && dp->dec.type == AVMEDIA_TYPE_VIDEO) {
+                    int exit_flags = 0;
+                    pthread_mutex_lock(&dp->exit_lock);
+                    if (--dp->threads_count) {
+                        pthread_cond_wait(&dp->exit_cond, &dp->exit_lock);
+                        pthread_mutex_unlock(&dp->exit_lock);
+                        if (ret == AVERROR_EOF)
+                            ret = 0;
+                        goto finish;
+                    }
+                    av_log(dp, AV_LOG_VERBOSE, "Decoder %d exit_flags=%d, dp->threads_count=%d\n",thread_id, exit_flags, dp->threads_count);
+                    pthread_mutex_unlock(&dp->exit_lock);
+                }
                 break;
+            }
 
             /* report last frame duration to the scheduler */
             if (dec_ctx->codec_type == AVMEDIA_TYPE_AUDIO) {
@@ -1030,7 +1068,6 @@ static int decoder_thread(void *arg)
         dt.frame->pts       = dp->last_frame_pts == AV_NOPTS_VALUE ? AV_NOPTS_VALUE :
                               dp->last_frame_pts + dp->last_frame_duration_est;
         dt.frame->time_base = dp->last_frame_tb;
-
         ret = sch_dec_send(dp->sch, dp->sch_idx, dt.frame);
         if (ret < 0 && ret != AVERROR_EOF) {
             av_log(dp, AV_LOG_FATAL,
@@ -1050,6 +1087,7 @@ static int decoder_thread(void *arg)
     }
 
 finish:
+    pthread_cond_broadcast(&dp->exit_cond);
     if (dec_ctx != dp->dec_ctx) {
         avcodec_free_context(&dec_ctx);
     }
